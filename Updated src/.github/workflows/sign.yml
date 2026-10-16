@@ -1,0 +1,38 @@
+name: sign
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: sigstore/cosign-installer@v3
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install build
+      - run: python -m build
+
+      - name: Sign artifacts
+        run: |
+          for f in dist/*; do
+            cosign sign-blob --yes "$f" --output-signature "$f.sig"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-artifacts
+          path: |
+            dist/*
+            dist/*.sig
