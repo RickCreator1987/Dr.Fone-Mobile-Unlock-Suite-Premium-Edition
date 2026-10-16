@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mss
+description: Mobile Service Suite - compliance-first device service API
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
