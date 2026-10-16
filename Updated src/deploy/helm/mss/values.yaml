@@ -1,0 +1,31 @@
+image:
+  repository: ghcr.io/your-org/mobile-service-suite
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+persistence:
+  enabled: true
+  size: 5Gi
+  storageClass: ""
+
+audit:
+  retentionDays: 1095
+
+env:
+  MSS_DB_PATH: /data/mss.db
+  MSS_AUDIT_PATH: /data/audit.jsonl
