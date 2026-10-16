@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from mss.core.audit import AuditLog
+from mss.core.authorization import (
+    AuthorizationError,
+    AuthorizationGate,
+    AuthorizationRecord,
+    ConsentType,
+)
+from mss.core.migrations import migrate
+from mss.core.rbac import Permission, Principal, Role
+from mss.core.store import AuthorizationStore
+from mss.use_cases.authorize import AuthorizeDevice, AuthorizeRequest
+
+DEFAULT_DB = Path("mss.db")
+DEFAULT_AUDIT = Path("audit.jsonl")
+
+
+def _principal_from_args(args: argparse.Namespace) -> Principal:
+    roles = frozenset(Role(r) for r in args.role)
+    return Principal(user_id=args.user, roles=roles)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="mss", description="Mobile Service Suite")
+    parser.add_argument("--db", default=str(DEFAULT_DB))
+    parser.add_argument("--audit-log", default=str(DEFAULT_AUDIT))
+    parser.add_argument("--user", default="cli")
+    parser.add_argument(
+        "--role",
+        action="append",
+        default=["admin"],
+        choices=[r.value for r in Role],
+    )
+
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("migrate", help="Apply database migrations")
+
+    verify = sub.add_parser("verify-authorization", help="Check authorization for a device")
+    verify.add_argument("device_id")
+    verify.add_argument("--evidence", required=True)
+    verify.add_argument("--authorized-by", required=True)
+    verify.add_argument(
+        "--consent-type",
+        choices=[c.value for c in ConsentType],
+        default=ConsentType.OWNER.value,
+    )
+
+    grant = sub.add_parser("grant-authorization", help="Persist an authorization record")
+    grant.add_argument("device_id")
+    grant.add_argument("--evidence", required=True)
+    grant.add_argument("--authorized-by", required=True)
+    grant.add_argument(
+        "--consent-type",
+        choices=[c.value for c in ConsentType],
+        default=ConsentType.OWNER.value,
+    )
+
+    sub.add_parser("verify-audit", help="Verify audit log integrity")
+
+    export = sub.add_parser("export-audit", help="Export authorizations as JSON")
+    export.add_argument("--out", default="-")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    audit = AuditLog(Path(args.audit_log))
+    store = AuthorizationStore(Path(args.db))
+    principal = _principal_from_args(args)
+
+    if args.cmd == "migrate":
+        applied = migrate(Path(args.db))
+        print(f"applied {applied} migration(s)")
+        return 0
+
+    if args.cmd == "verify-authorization":
+        record = AuthorizationRecord(
+            device_id=args.device_id,
+            consent_type=ConsentType(args.consent_type),
+            authorized_by=args.authorized_by,
+            timestamp=datetime.now(timezone.utc),
+            evidence_path=Path(args.evidence),
+        )
+        try:
+            AuthorizationGate([record]).require(args.device_id)
+        except AuthorizationError as exc:
+            audit.append(
+                {
+                    "event": "authorization_denied",
+                    "device_id": args.device_id,
+                    "operator": principal.user_id,
+                    "reason": str(exc),
+                }
+            )
+            print(f"DENIED: {exc}", file=sys.stderr)
+            return 1
+        audit.append(
+            {
+                "event": "authorization_granted",
+                "device_id": args.device_id,
+                "operator": principal.user_id,
+                "authorized_by": args.authorized_by,
+            }
+        )
+        print("AUTHORIZED")
+        return 0
+
+    if args.cmd == "grant-authorization":
+        principal.require(Permission.APPROVE_AUTHORIZATION)
+        use_case = AuthorizeDevice(store=store, audit=audit)
+        result = use_case.run(
+            principal,
+            AuthorizeRequest(
+                device_id=args.device_id,
+                consent_type=ConsentType(args.consent_type),
+                authorized_by=args.authorized_by,
+                evidence_path=Path(args.evidence),
+            ),
+        )
+        print(
+            json.dumps(
+                {
+                    "authorization_id": result.authorization_id,
+                    "evidence_sha256": result.evidence_sha256,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.cmd == "verify-audit":
+        ok = audit.verify()
+        print("OK" if ok else "TAMPERED")
+        return 0 if ok else 1
+
+    if args.cmd == "export-audit":
+        principal.require(Permission.EXPORT_AUDIT)
+        data = store.export()
+        if args.out == "-":
+            print(data)
+        else:
+            Path(args.out).write_text(data, encoding="utf-8")
+        audit.append({"event": "audit_exported", "operator": principal.user_id})
+        return 0
+
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
